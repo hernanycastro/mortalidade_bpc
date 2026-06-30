@@ -1,0 +1,240 @@
+# ==============================================================================
+# SCRIPT DE REPRODUTIBILIDADE: ECOSSISTEMA DE MORTALIDADE BPC (2024)
+# METODOLOGIA: PESSOAS-ANO E CONVERSÃO M_X -> Q_X
+#
+# Autores: Hernany Gomes de Castro; Wederson Santos
+# Estudo: Análise do Risco de Mortalidade (HR e SMR) entre beneficiários do BPC
+# ==============================================================================
+
+setwd("seu caminho para diretorio de trabalho")
+
+# 1. AMBIENTE E DEPENDÊNCIAS ---------------------------------------------------
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  "data.table", "dplyr", "tidyr", "forcats", "stringr", "lubridate", "readxl",
+  "writexl", "survival", "randomForestSRC", "ggplot2", "scales", "broom", "janitor"
+)
+
+# 2. CONSTRUÇÃO DA TÁBUA DE SOBREVIVÊNCIA ADMINISTRATIVA BPC 2024 --------------
+print("1. Executando motor biométrico com conversão atuarial de Greville...")
+
+bpc_anonimo_2024 <- fread("bpc_agregado_2024.csv")
+pop_ibge         <- read_xlsx("projecoes_quinquenal.xlsx") %>% setDT() 
+sobrevida_sim    <- fread("base_sim.csv")
+base_sirc        <- fread("base_sirc.csv", select = c("DS_SEXO", "DT_NASCIMENTO", "DT_OBITO"))
+
+tabua_bpc_2024 <- bpc_anonimo_2024 %>%
+  filter(Idade >= 0 & Idade <= 100) %>%
+  rename(
+    idade = Idade,
+    Sexo_Rotulo = Sexo,
+    CS_ESPECIE = Especie,
+    n_pessoas_real = Expostos_Anos_Risco,
+    obitos_reais = Obitos_Reais
+  ) %>%
+  group_by(CS_ESPECIE, Sexo_Rotulo) %>%
+  arrange(idade) %>%
+  mutate(
+    # Taxa Central de Mortalidade (m_x)
+    m_x = if_else(n_pessoas_real > 0, obitos_reais / n_pessoas_real, 0),
+    
+    # Conversão de Greville para Probabilidade de Morte (q_x)
+    q_x = (2 * m_x) / (2 + m_x), 
+    q_x = pmin(q_x, 1), 
+    q_x = if_else(idade == 100, 1, q_x),
+    
+    # Sobreviventes Teóricos (l_x)
+    l_x = 100000 * cumprod(1 - lag(q_x, default = 0)),
+    l_x_next = lead(l_x, default = 0),
+    
+    # Decrementos e Erro Padrão Corrigido via Fórmula de Greenwood Adaptada
+    d_x = l_x - l_x_next,
+    L_x = (l_x + l_x_next) / 2,
+    T_x = rev(cumsum(rev(L_x))),
+    e_x = if_else(l_x > 0, T_x / l_x, 0),
+    
+    # Cálculo do Erro Padrão da Expectativa de Vida (Variância de Chiang/Greenwood)
+    p_x_surv = 1 - q_x,
+    var_qx = if_else(obitos_reais > 0, (q_x^2 * (1 - q_x)) / obitos_reais, 0),
+    var_ex = rev(cumsum(rev(l_x^2 * (e_x + 0.5)^2 * var_qx))) / (l_x^2),
+    erro_padrao_ex = sqrt(pmax(var_ex, 0)),
+    
+    Ano = 2024
+  ) %>%
+  ungroup()
+
+
+# 3. PROCESSAMENTO DA REFERÊNCIA NACIONAL DE SAÚDE (SIM 2024) ------------------
+print("3. Processando base de dados de referência do SIM 2024...")
+
+sobrevida_sim[, DT_OBITO := as.IDate(DT_OBITO)]
+sobrevida_sim[, DT_NASCIMENTO := as.IDate(DT_NASCIMENTO)]
+sobrevida_sim[, tempo_anos := as.numeric(DT_OBITO - DT_NASCIMENTO) / 365.25]
+
+df_sim_2024 <- sobrevida_sim[year(DT_OBITO) == 2024 & tempo_anos >= 0 & tempo_anos <= 125 & CO_SEXO %in% c(1, 2)]
+df_sim_2024 <- unique(df_sim_2024, by = c("DT_NASCIMENTO", "DT_OBITO", "CO_SEXO", "CO_MUN"))
+df_sim_2024[, Sexo_Rotulo := ifelse(CO_SEXO == 1, "Masculino", "Feminino")]
+
+pop_2024_base <- pop_ibge[LOCAL == "Brasil" & SEXO %in% c("Homens", "Mulheres") & `GRUPO ETÁRIO` != "Total"]
+referencia_ibge_2024 <- pop_2024_base[, {
+  start_age <- as.numeric(sub("^([0-9]+).*", "\\1", `GRUPO ETÁRIO`))
+  if (!is.na(start_age)) {
+    end_age <- if(grepl("\\+", `GRUPO ETÁRIO`) | start_age >= 90) 100 else start_age + 4
+    .(idade = start_age:end_age, n_pessoas_real = `2024` / (end_age - start_age + 1))
+  }
+}, by = .(SEXO, `GRUPO ETÁRIO`)]
+referencia_ibge_2024[, Sexo_Rotulo := ifelse(SEXO == "Homens", "Masculino", "Feminino")]
+
+obitos_sim_agg <- df_sim_2024[, .(obitos_sim = .N), by = .(idade = floor(tempo_anos), Sexo_Rotulo)]
+
+tabela_vida_sim <- referencia_ibge_2024 %>%
+  left_join(obitos_sim_agg, by = c("idade", "Sexo_Rotulo")) %>%
+  mutate(obitos_sim = coalesce(obitos_sim, 0)) %>%
+  group_by(Sexo_Rotulo) %>%
+  arrange(idade) %>%
+  mutate(
+    m_x_sim = if_else(n_pessoas_real > 0, obitos_sim / n_pessoas_real, 0),
+    qx_sim = (2 * m_x_sim) / (2 + m_x_sim),
+    qx_sim = pmin(if_else(idade == 100, 1, qx_sim), 1),
+    l_x = 100000 * cumprod(1 - lag(qx_sim, default = 0)),
+    e_x = rev(cumsum(rev(coalesce((l_x + lead(l_x, default = 0)) / 2, 0)))) / l_x
+  ) %>% ungroup()
+
+
+# 4. PROCESSAMENTO DA REFERÊNCIA DO REGISTRO CIVIL (SIRC 2024) ------------------
+print("4. Processando base de dados de referência do SIRC 2024...")
+
+base_sirc_limpa <- base_sirc %>%
+  mutate(
+    dt_nascimento = as.Date(DT_NASCIMENTO),
+    dt_obito = as.Date(DT_OBITO),
+    Sexo_Rotulo = case_when(
+      DS_SEXO %in% c("MASCULINO", "M", "1") ~ "Masculino",
+      DS_SEXO %in% c("FEMININO", "F", "3") ~ "Feminino",
+      TRUE ~ "Outro/NA"
+    ),
+    idade_inteira = floor(as.numeric(difftime(dt_obito, dt_nascimento, units = "days")) / 365.25),
+    Ano_Obito = year(dt_obito)
+  ) %>%
+  filter(Ano_Obito == 2024 & idade_inteira >= 0 & idade_inteira <= 100 & Sexo_Rotulo != "Outro/NA")
+
+df_obitos_sirc_2024 <- base_sirc_limpa %>%
+  group_by(Sexo_Rotulo, idade = idade_inteira) %>%
+  summarise(obitos_sirc = n(), .groups = "drop")
+
+tabua_sirc_2024 <- df_obitos_sirc_2024 %>%
+  inner_join(referencia_ibge_2024, by = c("Sexo_Rotulo", "idade")) %>%
+  arrange(Sexo_Rotulo, idade) %>%
+  group_by(Sexo_Rotulo) %>%
+  mutate(
+    m_x = obitos_sirc / n_pessoas_real,
+    q_x_sirc = pmin((2 * m_x) / (2 + m_x), 1),
+    q_x_sirc = if_else(idade == 100, 1, q_x_sirc),
+    l_x = 100000 * cumprod(1 - lag(q_x_sirc, default = 0)),
+    l_x_next = lead(l_x, n = 1L, default = 0),
+    L_x_teorico = (l_x + l_x_next) / 2,
+    T_x = rev(cumsum(rev(L_x_teorico))),
+    e_x_sirc = ifelse(l_x == 0, 0, T_x / l_x)
+  ) %>% ungroup()
+
+
+# 5. TRIANGULAÇÃO, SMR E TESTE LOG-RANK ----------------------------------------
+print("5. Executando triangulação analítica cruzada de riscos...")
+
+df_comparativo_bpc_sirc <- tabua_bpc_2024 %>%
+  inner_join(tabela_vida_sim %>% select(Sexo_Rotulo, idade, qx_sim, e_x_sim = e_x), by = c("Sexo_Rotulo", "idade")) %>%
+  mutate(
+    HR_vs_IBGE = q_x / qx_sim,
+    E_esperado_ibge = n_pessoas_real * qx_sim,
+    Gap_Longevidade = e_x - e_x_sim
+  )
+
+df_smr_ibge <- df_comparativo_bpc_sirc %>%
+  group_by(CS_ESPECIE, Sexo_Rotulo) %>%
+  summarise(
+    Obs = sum(obitos_reais, na.rm = TRUE),
+    Esp_IBGE = sum(E_esperado_ibge, na.rm = TRUE),
+    SMR_IBGE = Obs / Esp_IBGE, .groups = "drop"
+  )
+
+
+# 6. VALIDAÇÃO PREDITIVA POR MACHINE LEARNING (Random Survival Forests) --------
+print("6. Executando teste de estresse preditivo via Random Survival Forests...")
+
+set.seed(123)
+amostra_treino <- tabela_vida_sim %>%
+  select(idade, Sexo_Rotulo, q_x_analise = qx_sim) %>% 
+  mutate(
+    Status = rbinom(n(), 1, q_x_analise),
+    Sexo_Rotulo = as.factor(Sexo_Rotulo)
+  ) %>%
+  sample_n(min(50000, nrow(.)))
+
+modelo_rsf_nacional <- rfsrc(
+  Surv(idade, Status) ~ Sexo_Rotulo, 
+  data = amostra_treino, 
+  ntree = 500, nodesize = 5, importance = TRUE
+)
+
+amostra_bpc_teste <- tabua_bpc_2024 %>%
+  select(idade, Sexo_Rotulo, q_x) %>% 
+  mutate(
+    Status = rbinom(n(), 1, q_x),
+    Sexo_Rotulo = factor(Sexo_Rotulo, levels = levels(amostra_treino$Sexo_Rotulo))
+  ) %>%
+  sample_n(min(50000, nrow(.)))
+
+predicao_bpc <- predict(modelo_rsf_nacional, amostra_bpc_teste)
+
+
+# 7. GERAÇÃO E EXPORTAÇÃO DAS FIGURAS CORRIGIDAS DO ARTIGO ---------------------
+print("7. Gerando e exportando as Figuras Oficiais Corrigidas...")
+
+# --- FIGURA 2: Curvas de Sobrevivência (CORRIGIDO: IBGE incluído na Legenda) ---
+figura_2 <- ggplot() +
+  geom_line(data = tabua_bpc_2024, aes(x = idade, y = l_x / 100000, color = CS_ESPECIE), linewidth = 1.2) +
+  geom_line(data = tabela_vida_sim, aes(x = idade, y = l_x / 100000, color = "IBGE 2024"), linewidth = 1.1) +
+  facet_wrap(~Sexo_Rotulo) +
+  scale_y_continuous(labels = percent) +
+  scale_color_manual(values = c("IDOSO" = "#2E86C1", "PCD" = "#E67E22", "IBGE 2024" = "black")) +
+  labs(title = "Figura 2 - Curvas de Sobrevivência: BPC 2024 vs IBGE 2024",
+       x = "Idade (Anos)", y = "Probabilidade de Sobrevivência S(t)", color = "Grupo / Referência") +
+  theme_minimal() + theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+
+ggsave("Figura2_Curvas_Sobrevivencia.png", figura_2, width = 11, height = 7, dpi = 300)
+
+
+# --- FIGURA 3: Hazard Ratio (INCLUÍDO NO SCRIPT) ---
+figura_3 <- ggplot(df_comparativo_bpc_sirc, aes(x = idade, y = HR_vs_IBGE, color = Sexo_Rotulo)) +
+  geom_smooth(method = "loess", se = FALSE, linewidth = 1.2) +
+  geom_hline(yintercept = 1.0, color = "red", linetype = "dashed", linewidth = 0.8) +
+  facet_wrap(~CS_ESPECIE, scales = "free_y") +
+  scale_color_manual(values = c("Feminino" = "#E67E22", "Masculino" = "#2E86C1")) +
+  labs(title = "Figura 3 - Hazard Ratio (HR) por Idade: BPC 2024 vs IBGE 2024",
+       x = "Idade", y = "Hazard Ratio (Mortalidade Relativa)", color = "Gênero") +
+  theme_minimal() + theme(legend.position = "bottom", strip.text = element_text(face = "bold"))
+
+ggsave("Figura3_Hazard_Ratio.png", figura_3, width = 11, height = 7, dpi = 300)
+
+
+# --- FIGURA 4: SMR Barras (CORRIGIDO: Título e Eixos Vinculados ao IBGE 2024) ---
+figura_4 <- ggplot(df_smge <- df_smr_ibge, aes(x = Sexo_Rotulo, y = SMR_IBGE, fill = CS_ESPECIE)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_text(aes(label = round(SMR_IBGE, 2)), position = position_dodge(width = 0.6), vjust = -0.5, fontface = "bold") +
+  scale_fill_manual(values = c("IDOSO" = "#2E86C1", "PCD" = "#E67E22")) +
+  geom_hline(yintercept = 1.0, color = "red", linetype = "dashed", linewidth = 0.8) +
+  labs(title = "Figura 4 - SMR BPC 2024 (Referência: IBGE 2024)",
+       x = "Gênero", y = "SMR vs IBGE 2024", fill = "Espécie") +
+  theme_minimal() + theme(legend.position = "bottom")
+
+ggsave("Figura4_SMR_Barras.png", figura_4, width = 11, height = 7, dpi = 300)
+
+
+# 8. EXPORTAÇÃO COMPLETA DOS ARTEFATOS -----------------------------------------
+write_xlsx(list(
+  SMR_BPC_vs_IBGE = df_smr_ibge,
+  Triangulacao_Detalhada = df_comparativo_bpc_sirc,
+  Anexo_Tabua_Completa = tabua_bpc_2024
+), "Outputs_Mortalidade_BPC_2024.xlsx")
+
+print("--- [PIPELINE COMPLETO EXECUTADO COM SUCESSO] ---")
